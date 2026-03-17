@@ -1,9 +1,10 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { supabase } from "@/integrations/supabase/client";
 
 export interface PageSummary {
   pageNumber: number;
   summary: string;
-  status: "pending" | "scanning" | "complete";
+  status: "pending" | "scanning" | "complete" | "error";
   timestamp?: string;
 }
 
@@ -23,47 +24,161 @@ export interface AxiomInstance {
   currentPage: number;
   summaries: PageSummary[];
   hypotheses: Hypothesis[];
-  status: "idle" | "scanning" | "complete";
+  status: "idle" | "scanning" | "complete" | "error";
   fileUrl: string | null;
+  pdfText: string[];
 }
 
-const MOCK_SUMMARIES: Record<number, string> = {
-  1: "The document establishes a foundational framework for distributed consensus mechanisms, introducing novel terminology for fault-tolerant protocols in adversarial environments.",
-  2: "Mathematical proofs demonstrate that Byzantine fault tolerance requires a minimum of 3f+1 nodes to withstand f faulty processors. Time complexity bounds are established at O(n²).",
-  3: "A comparative analysis of Paxos and Raft protocols reveals convergence properties under partial synchrony. The authors identify a previously unexplored edge case in leader election.",
-  4: "Experimental results from a 1000-node testbed confirm theoretical bounds. Throughput degrades linearly beyond 33% fault injection, validating the theoretical model from Page 2.",
-  5: "The conclusion proposes a hybrid protocol combining elements of both Paxos and Raft, suggesting 40% improvement in recovery time. Cross-references findings from Pages 1-4.",
-};
+async function extractTextFromPDF(file: File): Promise<string[]> {
+  // Read PDF as text — basic extraction via ArrayBuffer
+  // For real production use, you'd use pdf.js, but for now we send the file content
+  // and let the AI work with page-level context
+  const text = await file.text();
+  
+  // Split into rough pages — PDFs have page markers
+  // We'll simulate page splits for the AI to process
+  const roughPages: string[] = [];
+  const chunkSize = Math.max(500, Math.floor(text.length / 10));
+  
+  for (let i = 0; i < text.length; i += chunkSize) {
+    const chunk = text.slice(i, i + chunkSize).trim();
+    if (chunk.length > 50) {
+      roughPages.push(chunk);
+    }
+  }
+  
+  // If no usable text extracted (binary PDF), return empty pages
+  // The AI will still generate context-aware summaries
+  if (roughPages.length === 0) {
+    return Array.from({ length: 5 }, (_, i) => `[Page ${i + 1} — binary content, no extractable text]`);
+  }
+  
+  return roughPages.slice(0, 20); // Cap at 20 pages
+}
 
-const generateHypothesis = (fromPage: number, toPage: number): Hypothesis => {
-  const hypotheses: Record<string, string> = {
-    "1-2": "The fault tolerance framework (P1) combined with the Byzantine bounds (P2) suggests a novel lower bound for asynchronous consensus that hasn't been formally proven.",
-    "2-3": "The O(n²) complexity from P2 may be reducible to O(n log n) using the Raft optimizations identified in P3's edge case analysis.",
-    "3-4": "The unexplored leader election edge case (P3) likely caused the non-linear degradation pattern observed at exactly 28% fault injection (P4).",
-    "1-4": "Cross-referencing P1's framework with P4's empirical data reveals the theoretical model underestimates real-world performance by approximately 12%.",
-    "2-5": "The proposed hybrid protocol (P5) should inherit the O(n²) bound from P2, not improve it — suggesting an error in the authors' complexity analysis.",
-    "4-5": "The 40% improvement claim (P5) is consistent with P4's testbed data only under partial synchrony — the claim may not hold under full asynchrony.",
-  };
+async function callAI(
+  pageText: string,
+  pageNumber: number,
+  totalPages: number,
+  previousSummaries: { pageNumber: number; summary: string }[],
+  mode: "summary" | "hypothesis" = "summary"
+): Promise<{ summary?: string; hypothesis?: { text: string; confidence: number }; error?: string }> {
+  const { data, error } = await supabase.functions.invoke("analyze-pdf-page", {
+    body: { pageText, pageNumber, totalPages, previousSummaries, mode },
+  });
 
-  const key = `${fromPage}-${toPage}`;
-  return {
-    id: `hyp-${fromPage}-${toPage}-${Date.now()}`,
-    fromPage,
-    toPage,
-    text: hypotheses[key] || `Correlation detected between structural elements on Page ${fromPage} and conclusions drawn on Page ${toPage}. Further analysis recommended.`,
-    confidence: Math.round(85 + Math.random() * 12 * 10) / 10,
-  };
-};
+  if (error) {
+    console.error("Edge function error:", error);
+    return { error: error.message || "AI analysis failed" };
+  }
+
+  if (data?.error) {
+    return { error: data.error };
+  }
+
+  return data;
+}
 
 export function useAxiomEngine() {
   const [instances, setInstances] = useState<AxiomInstance[]>([]);
   const [activeInstanceId, setActiveInstanceId] = useState<string | null>(null);
+  const scanningRef = useRef<Set<string>>(new Set());
 
   const activeInstance = instances.find((i) => i.id === activeInstanceId) || null;
 
-  const createInstance = useCallback((file: File) => {
+  const updateInstance = useCallback((id: string, updater: (inst: AxiomInstance) => AxiomInstance) => {
+    setInstances((prev) => prev.map((inst) => (inst.id === id ? updater(inst) : inst)));
+  }, []);
+
+  const scanInstance = useCallback(async (instanceId: string, pdfText: string[], totalPages: number) => {
+    if (scanningRef.current.has(instanceId)) return;
+    scanningRef.current.add(instanceId);
+
+    updateInstance(instanceId, (inst) => ({ ...inst, status: "scanning" }));
+
+    const completedSummaries: { pageNumber: number; summary: string }[] = [];
+
+    for (let page = 1; page <= totalPages; page++) {
+      // Check if instance still exists
+      if (!scanningRef.current.has(instanceId)) break;
+
+      // Mark page as scanning
+      updateInstance(instanceId, (inst) => ({
+        ...inst,
+        currentPage: page,
+        summaries: inst.summaries.map((s) =>
+          s.pageNumber === page ? { ...s, status: "scanning" } : s
+        ),
+      }));
+
+      // Call AI for summary
+      const pageContent = pdfText[page - 1] || `[Page ${page} of ${totalPages}]`;
+      const result = await callAI(pageContent, page, totalPages, completedSummaries, "summary");
+
+      if (result.error) {
+        updateInstance(instanceId, (inst) => ({
+          ...inst,
+          summaries: inst.summaries.map((s) =>
+            s.pageNumber === page
+              ? { ...s, status: "error", summary: `Error: ${result.error}` }
+              : s
+          ),
+        }));
+        // Continue to next page even on error
+        continue;
+      }
+
+      const summary = result.summary || "No summary generated.";
+      const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+
+      completedSummaries.push({ pageNumber: page, summary });
+
+      // Update summary
+      updateInstance(instanceId, (inst) => ({
+        ...inst,
+        summaries: inst.summaries.map((s) =>
+          s.pageNumber === page
+            ? { ...s, status: "complete", summary, timestamp }
+            : s
+        ),
+      }));
+
+      // Generate hypothesis every 2 pages (after page 2+)
+      if (page >= 2 && page % 2 === 0 && completedSummaries.length >= 2) {
+        const hypResult = await callAI("", page, totalPages, completedSummaries, "hypothesis");
+        if (hypResult.hypothesis) {
+          const fromPage = Math.max(1, page - 1);
+          updateInstance(instanceId, (inst) => ({
+            ...inst,
+            hypotheses: [
+              ...inst.hypotheses,
+              {
+                id: `hyp-${fromPage}-${page}-${Date.now()}`,
+                fromPage,
+                toPage: page,
+                text: hypResult.hypothesis!.text,
+                confidence: hypResult.hypothesis!.confidence,
+              },
+            ],
+          }));
+        }
+      }
+
+      // Small delay between pages to avoid rate limiting
+      if (page < totalPages) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+
+    updateInstance(instanceId, (inst) => ({ ...inst, status: "complete" }));
+    scanningRef.current.delete(instanceId);
+  }, [updateInstance]);
+
+  const createInstance = useCallback(async (file: File) => {
     const fileUrl = URL.createObjectURL(file);
-    const totalPages = Math.max(3, Math.floor(Math.random() * 5) + 3);
+    const pdfText = await extractTextFromPDF(file);
+    const totalPages = Math.max(3, pdfText.length);
+
     const newInstance: AxiomInstance = {
       id: `inst-${Date.now()}`,
       name: file.name.replace(".pdf", ""),
@@ -78,109 +193,30 @@ export function useAxiomEngine() {
       hypotheses: [],
       status: "idle",
       fileUrl,
+      pdfText,
     };
 
     setInstances((prev) => [...prev, newInstance]);
     setActiveInstanceId(newInstance.id);
 
     // Start autonomous scanning
-    setTimeout(() => startScanning(newInstance.id, totalPages), 500);
-  }, []);
-
-  const startScanning = (instanceId: string, totalPages: number) => {
-    setInstances((prev) =>
-      prev.map((inst) =>
-        inst.id === instanceId ? { ...inst, status: "scanning" } : inst
-      )
-    );
-
-    let page = 1;
-
-    const scanPage = () => {
-      if (page > totalPages) {
-        setInstances((prev) =>
-          prev.map((inst) =>
-            inst.id === instanceId ? { ...inst, status: "complete" } : inst
-          )
-        );
-        return;
-      }
-
-      const currentPage = page;
-
-      // Mark as scanning
-      setInstances((prev) =>
-        prev.map((inst) =>
-          inst.id === instanceId
-            ? {
-                ...inst,
-                currentPage: currentPage,
-                summaries: inst.summaries.map((s) =>
-                  s.pageNumber === currentPage ? { ...s, status: "scanning" } : s
-                ),
-              }
-            : inst
-        )
-      );
-
-      // Complete after delay
-      setTimeout(() => {
-        const summary = MOCK_SUMMARIES[currentPage] ||
-          `Page ${currentPage} contains structured data tables and cross-references to earlier sections. Key findings support the document's central thesis with ${Math.round(88 + Math.random() * 10)}% statistical significance.`;
-
-        setInstances((prev) =>
-          prev.map((inst) => {
-            if (inst.id !== instanceId) return inst;
-
-            const updatedSummaries = inst.summaries.map((s) =>
-              s.pageNumber === currentPage
-                ? {
-                    ...s,
-                    status: "complete" as const,
-                    summary,
-                    timestamp: new Date().toLocaleTimeString("en-US", { hour12: false }),
-                  }
-                : s
-            );
-
-            // Generate hypothesis every 2 pages
-            const newHypotheses = [...inst.hypotheses];
-            if (currentPage >= 2 && currentPage % 2 === 0) {
-              newHypotheses.push(
-                generateHypothesis(currentPage - 1, currentPage)
-              );
-            }
-            if (currentPage >= 3) {
-              newHypotheses.push(generateHypothesis(1, currentPage));
-            }
-
-            return {
-              ...inst,
-              summaries: updatedSummaries,
-              hypotheses: newHypotheses,
-            };
-          })
-        );
-
-        page++;
-        setTimeout(scanPage, 2000 + Math.random() * 1500);
-      }, 1500 + Math.random() * 1000);
-    };
-
-    scanPage();
-  };
+    setTimeout(() => scanInstance(newInstance.id, pdfText, totalPages), 300);
+  }, [scanInstance]);
 
   const spawnFromHypothesis = useCallback((hypothesis: Hypothesis) => {
+    const sourceText = `SOURCE HYPOTHESIS: "${hypothesis.text}" (Confidence: ${hypothesis.confidence}%)`;
+    const totalPages = 3;
+
     const newInstance: AxiomInstance = {
       id: `inst-${Date.now()}`,
       name: `Thread: P${hypothesis.fromPage}→P${hypothesis.toPage}`,
       fileName: "Derived Instance",
-      totalPages: 3,
+      totalPages,
       currentPage: 0,
       summaries: [
         {
           pageNumber: 1,
-          summary: `SOURCE HYPOTHESIS: "${hypothesis.text}"`,
+          summary: sourceText,
           status: "complete",
           timestamp: new Date().toLocaleTimeString("en-US", { hour12: false }),
         },
@@ -190,12 +226,17 @@ export function useAxiomEngine() {
       hypotheses: [],
       status: "idle",
       fileUrl: null,
+      pdfText: [
+        sourceText,
+        `Explore deeper implications of the hypothesis connecting Page ${hypothesis.fromPage} and Page ${hypothesis.toPage}`,
+        `Synthesize final conclusions and suggest next research directions based on the hypothesis`,
+      ],
     };
 
     setInstances((prev) => [...prev, newInstance]);
     setActiveInstanceId(newInstance.id);
-    setTimeout(() => startScanning(newInstance.id, 3), 800);
-  }, []);
+    setTimeout(() => scanInstance(newInstance.id, newInstance.pdfText, totalPages), 500);
+  }, [scanInstance]);
 
   return {
     instances,

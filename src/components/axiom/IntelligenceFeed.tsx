@@ -1,3 +1,4 @@
+import { useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { ArrowRight, Zap } from "lucide-react";
 import type { AxiomInstance, Hypothesis } from "@/hooks/useAxiomEngine";
@@ -8,10 +9,22 @@ interface IntelligenceFeedProps {
 }
 
 export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeedProps) {
+  const feedRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to bottom when new items appear
+  useEffect(() => {
+    if (feedRef.current) {
+      feedRef.current.scrollTo({
+        top: feedRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    }
+  }, [instance?.summaries, instance?.hypotheses]);
+
   if (!instance) {
     return (
       <div className="h-full flex flex-col bg-secondary">
-        <div className="p-6 border-b border-border">
+        <div className="p-6 border-b border-border shrink-0">
           <div className="font-geist-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
             Intelligence Feed
           </div>
@@ -25,7 +38,7 @@ export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeed
     );
   }
 
-  const completedSummaries = instance.summaries.filter((s) => s.status === "complete");
+  const completedSummaries = instance.summaries.filter((s) => s.status === "complete" || s.status === "error");
   const scanningPage = instance.summaries.find((s) => s.status === "scanning");
 
   // Interleave summaries and hypotheses
@@ -37,7 +50,6 @@ export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeed
 
   completedSummaries.forEach((s) => {
     feedItems.push({ type: "summary", data: s });
-    // Insert hypotheses that end at this page
     instance.hypotheses
       .filter((h) => h.toPage === s.pageNumber)
       .forEach((h) => feedItems.push({ type: "hypothesis", data: h }));
@@ -48,9 +60,9 @@ export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeed
   }
 
   return (
-    <div className="h-full flex flex-col bg-secondary">
+    <div className="h-full flex flex-col bg-secondary min-h-0">
       {/* Header */}
-      <div className="p-6 border-b border-border">
+      <div className="p-6 border-b border-border shrink-0">
         <div className="font-geist-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
           Intelligence Feed
         </div>
@@ -66,26 +78,29 @@ export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeed
                     ).toFixed(1)
                   : "—"
               }%`
+            : instance.status === "error"
+            ? "Error during analysis"
             : "Awaiting input"}
         </div>
       </div>
 
-      {/* Feed */}
-      <div className="flex-1 overflow-y-auto">
+      {/* Feed — scrollable */}
+      <div ref={feedRef} className="flex-1 overflow-y-auto min-h-0">
         <AnimatePresence mode="popLayout">
-          {feedItems.map((item, idx) => {
+          {feedItems.map((item) => {
             if (item.type === "summary") {
+              const isError = item.data.status === "error";
               return (
                 <motion.div
                   key={`summary-${item.data.pageNumber}`}
                   initial={{ opacity: 0, x: 20 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ duration: 0.8, ease: [0.19, 1, 0.22, 1] }}
-                  className="border-l-2 border-foreground bg-background p-5 border-b border-b-border"
+                  className={`border-l-2 ${isError ? "border-destructive" : "border-foreground"} bg-background p-5 border-b border-b-border`}
                 >
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-geist-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
-                      Page {item.data.pageNumber} — Summary
+                      Page {item.data.pageNumber} — {isError ? "Error" : "Summary"}
                     </span>
                     {item.data.timestamp && (
                       <span className="font-geist-mono text-[10px] text-muted-foreground/50">
@@ -93,7 +108,7 @@ export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeed
                       </span>
                     )}
                   </div>
-                  <p className="font-document text-[14px] leading-relaxed text-foreground/80">
+                  <p className={`font-document text-[14px] leading-relaxed ${isError ? "text-destructive" : "text-foreground/80"}`}>
                     {item.data.summary}
                   </p>
                 </motion.div>
@@ -155,7 +170,7 @@ export function IntelligenceFeed({ instance, onSpawnInstance }: IntelligenceFeed
                       className="h-full bg-ai-active"
                       initial={{ width: "0%" }}
                       animate={{ width: "100%" }}
-                      transition={{ duration: 1.5, ease: "linear", repeat: Infinity }}
+                      transition={{ duration: 2, ease: "linear", repeat: Infinity }}
                     />
                   </div>
                 </motion.div>
