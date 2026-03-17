@@ -1,16 +1,42 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { DocumentLibrary } from "@/components/axiom/DocumentLibrary";
+import { PDFViewer } from "@/components/axiom/PDFViewer";
+import { IntelligenceFeed } from "@/components/axiom/IntelligenceFeed";
+import { useAxiomEngine } from "@/hooks/useAxiomEngine";
 
-// IMPORTANT: Fully REPLACE this with your own code
-const PlaceholderIndex = () => {
-  // PLACEHOLDER: Replace this entire return statement with the user's app.
-  // The inline background color is intentionally not part of the design system.
+const Index = () => {
+  const {
+    instances,
+    activeInstance,
+    activeInstanceId,
+    setActiveInstanceId,
+    createInstance,
+    spawnFromHypothesis,
+  } = useAxiomEngine();
+
+  const handleUpload = (file: File) => {
+    createInstance(file);
+  };
+
   return (
-    <div className="flex min-h-screen items-center justify-center" style={{ backgroundColor: '#fcfbf8' }}>
-      <img data-lovable-blank-page-placeholder="REMOVE_THIS" src="/placeholder.svg" alt="Your app will live here!" />
+    <div className="h-screen w-screen grid grid-cols-[280px_1fr_400px] overflow-hidden bg-background">
+      {/* Left Rail: Document Library */}
+      <DocumentLibrary
+        instances={instances}
+        activeInstanceId={activeInstanceId}
+        onSelectInstance={setActiveInstanceId}
+        onUpload={handleUpload}
+      />
+
+      {/* Center: PDF Viewer */}
+      <PDFViewer instance={activeInstance} onUpload={handleUpload} />
+
+      {/* Right Rail: Intelligence Feed */}
+      <IntelligenceFeed
+        instance={activeInstance}
+        onSpawnInstance={spawnFromHypothesis}
+      />
     </div>
   );
 };
-
-const Index = PlaceholderIndex;
 
 export default Index;
